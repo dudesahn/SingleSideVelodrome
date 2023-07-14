@@ -1,38 +1,34 @@
 // SPDX-License-Identifier: AGPL-3.0
 pragma solidity ^0.8.15;
 
-// can pull a lot of logic for this from my routerV2 update, mixed with from previous knowledge from SSCs and gary's velodrome strategies/mine too
-
 // These are the core Yearn libraries
-import {BaseStrategy, StrategyParams} from "@yearnvaults/contracts/BaseStrategy.sol";
-import {SafeERC20, SafeMath, IERC20, Address} from "@openzeppelin/contracts/token/ERC20/SafeERC20.sol";
-import "@openzeppelin/contracts/math/Math.sol";
+import "@openzeppelin/contracts/utils/math/Math.sol";
+import "@yearnvaults/contracts/BaseStrategy.sol";
 
-// realistically we'll only need this at deployment. will need just to swap between our two tokens in our pool, potentially use outside pools as well if an option
-struct route {
-    address from;
-    address to;
-    bool stable;
-    address factory;
+interface IERC20Extended {
+    function decimals() external view returns (uint8);
+
+    function name() external view returns (string memory);
+
+    function symbol() external view returns (string memory);
+}
+
+interface IOracle {
+    function getPriceUsdcRecommended(address) external view returns (uint256);
 }
 
 interface IVelodromeRouter {
-    function addLiquidity(
-        address,
-        address,
-        bool,
-        uint256,
-        uint256,
-        uint256,
-        uint256,
-        address,
-        uint256
-    ) external returns (uint256 amountA, uint256 amountB, uint256 liquidity);
+    struct Routes {
+        address from;
+        address to;
+        bool stable;
+        address factory;
+    }
 
-    function getAmountsOut(
-        uint256 amountIn,
-        route[] memory routes
-    ) external view returns (uint256[] memory amounts);
+    function getAmountsOut(uint256 amountIn, Routes[] memory routes)
+        external
+        view
+        returns (uint256[] memory amounts);
 
     function removeLiquidity(
         address tokenA,
@@ -52,117 +48,313 @@ interface IVelodromeRouter {
         uint256 liquidity
     ) external view returns (uint256 amountA, uint256 amountB);
 
+    function quoteAddLiquidity(
+        address tokenA,
+        address tokenB,
+        bool stable,
+        address _factory,
+        uint256 amountADesired,
+        uint256 amountBDesired
+    )
+        external
+        view
+        returns (
+            uint256 amountA,
+            uint256 amountB,
+            uint256 liquidity
+        );
+
+    function addLiquidity(
+        address,
+        address,
+        bool,
+        uint256,
+        uint256,
+        uint256,
+        uint256,
+        address,
+        uint256
+    )
+        external
+        returns (
+            uint256 amountA,
+            uint256 amountB,
+            uint256 liquidity
+        );
+
     function swapExactTokensForTokens(
-        uint amountIn,
-        uint amountOutMin,
-        route[] calldata routes,
+        uint256 amountIn,
+        uint256 amountOutMin,
+        Routes[] memory routes,
         address to,
-        uint deadline
-    ) external returns (uint[] memory amounts);
+        uint256 deadline
+    ) external returns (uint256[] memory amounts);
+
+    function quoteStableLiquidityRatio(
+        address token0,
+        address token1,
+        address factory
+    ) external view returns (uint256 ratio);
 }
 
-interface IGauge {
-    function deposit(
-        uint amount,
-        uint tokenId
-    ) public;
+interface IVelodromeGauge {
+    function deposit(uint256 amount) external;
 
-    // not sure if we need this function
-    function claimFees() external returns (uint claimed0, uint claimed1);
+    function balanceOf(address) external view returns (uint256);
 
-    function withdraw(
-        uint amount
-    ) public;
+    function withdraw(uint256 amount) external;
 
-    function derivedBalance(
-        address account
-    ) public view returns (uint);
+    function getReward(address account) external;
 
-    function getReward(
-        address account,
-        address[] memory tokens
-    ) external;
+    function earned(address account) external view returns (uint256);
+
+    function stakingToken() external view returns (address);
 }
 
-interface IPool {
-    function getReserves() public view returns (uint _reserve0, uint _reserve1, uint _blockTimestampLast);
+interface IVelodromePool is IERC20 {
+    function stable() external view returns (bool);
+
+    function token0() external view returns (address);
+
+    function token1() external view returns (address);
+
+    function factory() external view returns (address);
+
+    function getAmountOut(uint256 amountIn, address tokenIn)
+        external
+        view
+        returns (uint256 amount);
 }
 
-contract Strategy is BaseStrategy {
+abstract contract StrategySingleSidedVelodrome is BaseStrategy {
     using SafeERC20 for IERC20;
-    using Address for address;
-    using SafeMath for uint256;
 
     /* ========== STATE VARIABLES ========== */
 
-    // swap stuff
-    address internal constant velodromeRouter =
-        0xa132DAB612dB5cB9fC9Ac426A0Cc215A3423F9c9;
-    bool public realiseLosses;
-    bool public depositerAvoid;
-    address[] public veloTokenPath; // path to sell VELO ARE THESE CORRECT???
-    address[] public usdcToSusdPath; // path to sell VELO
+    /// @notice Velodrome pool contract
+    IVelodromePool public pool;
 
-    address public velodromePoolAddress = 
-        address(0xd16232ad60188B68076a235c65d692090caba155); // StableV1 AMM - USDC/sUSD
-    address public stakingAddress = 
-       address(0xb03f52D2DB3e758DD49982Defd6AeEFEa9454e80); // Gauge
+    /// @notice Velodrome v2 router contract
+    IVelodromeRouter public constant router =
+        IVelodromeRouter(0xa062aE8A9c5e11aaA026fc2670B0D65cCc8B2858);
 
-    // tokens
-    IERC20 internal constant usdc =
-        IERC20(0x7F5c764cBc14f9669B88837ca1490cCa17c31607);
-    IERC20 internal constant susd =
-        IERC20(0x8c6f28f2F1A3C87F0f938b96d27520d9751ec8d9);
-    IERC20 internal constant velo =
-        IERC20(0x3c8B650257cFb5f272f799F5e2b4e65093a11a05);
+    // this means all of our fee values are in basis points
+    uint256 internal constant FEE_DENOMINATOR = 10000;
 
-    uint256 public lpSlippage = 9980; //0.2% slippage allowance
+    /// @notice The address of our base token (VELO v2)
+    IERC20 public constant velo =
+        IERC20(0x9560e827aF36c94D2Ac33a39bCE1Fe78631088Db);
+
+    uint256 public lastInvest; // default is 0
+    uint256 public minTimePerInvest; // = 3600;
+    uint256 public maxSingleInvest; // // 2 hbtc per hour default
+    uint256 public slippageProtectionIn; // = 50; //out of 10000. 50 = 0.5%
+    uint256 public slippageProtectionOut; // = 50; //out of 10000. 50 = 0.5%
+    bool public withdrawProtection;
+
+    uint8 public want_decimals;
+    uint8 public other_decimals;
+
+    /// @notice Token0 in our pool.
+    IERC20 public poolToken0;
+
+    /// @notice Token1 in our pool.
+    IERC20 public poolToken1;
+
+    /// @notice Token opposite our want in the pool.
+    IERC20 public other;
+
+    /// @notice Factory address that deployed our Velodrome pool.
+    address public factory;
+
+    /// @notice True if our pool is stable, false if volatile.
+    bool public isStablePool;
+
+    VaultAPI public yvToken;
+
+    /// @notice Our swap route to go from the other token in the pool to our want token.
+    /// @dev Struct is from token, to token, and true/false for stable/volatile.
+    IVelodromeRouter.Routes[] public swapRouteForWant;
+
+    /// @notice Our swap route to go from our want token to the other token in the pool
+    /// @dev Struct is from token, to token, and true/false for stable/volatile.
+    IVelodromeRouter.Routes[] public swapRouteForOther;
+
+    /// @notice Minimum profit size in USDC that we want to harvest.
+    /// @dev Only used in harvestTrigger.
+    uint256 public harvestProfitMinInUsdc;
+
+    /// @notice Maximum profit size in USDC that we want to harvest (ignore gas price once we get here).
+    /// @dev Only used in harvestTrigger.
+    uint256 public harvestProfitMaxInUsdc;
+
+    /// @notice Will only be true on the original deployed contract and not on clones; we don't want to clone a clone.
+    bool public isOriginal = true;
+
+    // we use this to be able to adjust our strategy's name
+    string internal stratName;
 
     uint256 immutable DENOMINATOR = 10_000;
-
-    string internal stratName; // we use this for our strategy's name on cloning
-
-    IPool public pool =
-        IPool(0xd16232ad60188B68076a235c65d692090caba155);
-    IGauge public gauge =
-       IGauge(0xb03f52D2DB3e758DD49982Defd6AeEFEa9454e80);
 
     uint256 dustThreshold = 1e14; // need to set this correctly for usdc and susd
 
     /* ========== CONSTRUCTOR ========== */
 
-    constructor(address _vault, string memory _name)
-        public
-        BaseStrategy(_vault)
-    {
-        _initializeStrat(_name);
+    constructor(
+        address _vault,
+        uint256 _maxSingleInvest,
+        uint256 _minTimePerInvest,
+        uint256 _slippageProtectionIn,
+        address _pool,
+        address _yvToken,
+        string memory _strategyName
+    ) BaseStrategy(_vault) {
+        _initializeStrat(
+            _maxSingleInvest,
+            _minTimePerInvest,
+            _slippageProtectionIn,
+            _pool,
+            _yvToken,
+            _strategyName
+        );
     }
 
     /* ========== CLONING ========== */
 
     event Cloned(address indexed clone);
 
-    // this is called by our original strategy, as well as any clones
-    function _initializeStrat(string memory _name) internal {
+    function initialize(
+        address _vault,
+        address _strategist,
+        uint256 _maxSingleInvest,
+        uint256 _minTimePerInvest,
+        uint256 _slippageProtectionIn,
+        address _pool,
+        address _yvToken,
+        string memory _strategyName
+    ) external {
+        //note: initialise can only be called once. in _initialize in BaseStrategy we have: require(address(want) == address(0), "Strategy already initialized");
+        _initialize(_vault, _strategist, _strategist, _strategist);
+        _initializeStrat(
+            _maxSingleInvest,
+            _minTimePerInvest,
+            _slippageProtectionIn,
+            _pool,
+            _yvToken,
+            _strategyName
+        );
+    }
+
+    function _initializeStrat(
+        uint256 _maxSingleInvest,
+        uint256 _minTimePerInvest,
+        uint256 _slippageProtectionIn,
+        address _pool,
+        address _yvToken,
+        string memory _strategyName
+    ) internal {
+        require(want_decimals == 0, "Already Initialized");
         // initialize variables
-        maxReportDelay = 86400; // 1 day in seconds, if we hit this then harvestTrigger = True // NEED TO CHANGE THIS???
-        healthCheck = 0xf13Cd6887C62B5beC145e30c38c4938c5E627fe0; // Fantom common health check // NEED TO CHANGE THIS TO OPTIMISM!!!
+        maxReportDelay = 7 days; // 7 days in seconds
+        healthCheck = 0x3d8F58774611676fd196D26149C71a9142C45296;
+
+        // should be able to get everything from the pool token itself—token0, token1, stable, factory
+        poolToken0 = IERC20(pool.token0());
+        poolToken1 = IERC20(pool.token1());
+        factory = pool.factory();
+        isStablePool = pool.stable();
+
+        // set a state var for our "other" address
+        if (wantIsToken0()) {
+            other = poolToken1;
+        } else {
+            other = poolToken0;
+        }
 
         // set our strategy's name
-        stratName = _name;
-
-        // turn off our credit harvest trigger to start with
-        minHarvestCredit = type(uint256).max;
+        stratName = _strategyName;
 
         // add approvals on all tokens
-        IERC20(velodromePoolAddress).approve(address(velodromeRouter), type(uint256).max);
-        usdc.approve(address(velodromeRouter), type(uint256).max);
-        susd.approve(address(velodromeRouter), type(uint256).max);
-        IERC20(velodromePoolAddress).approve(stakingAddress, type(uint256).max);
+        pool.approve(address(router), type(uint256).max);
+        poolToken0.approve(address(router), type(uint256).max);
+        poolToken1.approve(address(router), type(uint256).max);
+        pool.approve(address(yvToken), type(uint256).max);
 
-        // set our paths DO WE NEED TO TELL IT TO USE THE STABLE OR VOLATILE POOL???
-        veloTokenPath = [address(velo), address(usdc)]; 
-        usdcToSusdPath = [address(usdc), address(susd)];
+        if (
+            address(want) != address(poolToken0) &&
+            address(want) != address(poolToken1)
+        ) {
+            revert("Want must be a pool token");
+        }
+
+        withdrawProtection = true;
+        want_decimals = IERC20Extended(address(want)).decimals();
+        other_decimals = IERC20Extended(address(other)).decimals();
+
+        swapRouteForWant.push(
+            IVelodromeRouter.Routes(
+                address(other),
+                address(want),
+                isStablePool,
+                factory
+            )
+        );
+        swapRouteForOther.push(
+            IVelodromeRouter.Routes(
+                address(other),
+                address(want),
+                isStablePool,
+                factory
+            )
+        );
+
+        maxSingleInvest = _maxSingleInvest;
+        minTimePerInvest = _minTimePerInvest;
+        slippageProtectionIn = _slippageProtectionIn;
+        slippageProtectionOut = _slippageProtectionIn; // use In to start with to save on stack
+        yvToken = VaultAPI(_yvToken);
+    }
+
+    function cloneSingleSidedVelodrome(
+        address _vault,
+        address _strategist,
+        uint256 _maxSingleInvest,
+        uint256 _minTimePerInvest,
+        uint256 _slippageProtectionIn,
+        address _pool,
+        address _yvToken,
+        string memory _strategyName
+    ) external returns (address payable newStrategy) {
+        require(isOriginal, "Clone inception!");
+        bytes20 addressBytes = bytes20(address(this));
+
+        assembly {
+            // EIP-1167 bytecode
+            let clone_code := mload(0x40)
+            mstore(
+                clone_code,
+                0x3d602d80600a3d3981f3363d3d373d3d3d363d73000000000000000000000000
+            )
+            mstore(add(clone_code, 0x14), addressBytes)
+            mstore(
+                add(clone_code, 0x28),
+                0x5af43d82803e903d91602b57fd5bf30000000000000000000000000000000000
+            )
+            newStrategy := create(0, clone_code, 0x37)
+        }
+
+        StrategySingleSidedVelodrome(newStrategy).initialize(
+            _vault,
+            _strategist,
+            _maxSingleInvest,
+            _minTimePerInvest,
+            _slippageProtectionIn,
+            _pool,
+            _yvToken,
+            _strategyName
+        );
+
+        emit Cloned(newStrategy);
     }
 
     /* ========== VIEWS ========== */
@@ -171,58 +363,135 @@ contract Strategy is BaseStrategy {
         return stratName;
     }
 
-    // balance of usdc in strat - should be zero most of the time
+    function wantIsToken0() public view returns (bool) {
+        return (address(want) == address(poolToken0));
+    }
+
+    /// @notice Balance of want sitting in our strategy.
     function balanceOfWant() public view returns (uint256) {
-        return usdc.balanceOf(address(this));
+        return want.balanceOf(address(this));
     }
 
-    // balance of susd in strat - should be zero most of the time
-    function balanceOfSusd() public view returns (uint256) {
-        return susd.balanceOf(address(this));
+    // from our SSC strategy
+
+    function delegatedAssets() public view override returns (uint256) {
+        return vault.strategies(address(this)).totalDebt;
     }
 
-    // view our balance of unstaked velodrome LP tokens - should be zero most of the time
-    function balanceOfLPUnstaked() public view returns (uint256) {
-        return IERC20(velodromePoolAddress).balanceOf(address(this));
+    /// @notice Balance of underlying we will gain on our next harvest
+    function claimableProfits() public view returns (uint256 profits) {
+        uint256 assets = estimatedTotalAssets();
+        uint256 debt = delegatedAssets();
+
+        if (assets > debt) {
+            unchecked {
+                profits = assets - debt;
+            }
+        } else {
+            profits = 0;
+        }
     }
 
-    // view our balance of staked velodrome LP tokens
-    function balanceOfLPStaked() public view returns (uint256) {
-        // not sure this will work
-        return gauge.derivedBalance(address(this));
-    }
-
-    // view our balance of unstaked and staked velodrome LP tokens
-    function balanceOfLPTotal() public view returns (uint256) {
-        return balanceOfLPUnstaked().add(balanceOfLPStaked());
-    }
-
-    function balanceOfConstituents(uint256 liquidity)
+    // returns value of total
+    function veloPoolToWant(uint256 _poolAmount)
         public
         view
-        returns (uint256 amountUsdc, uint256 amountSusd)
+        returns (uint256 totalWant)
     {
-        (amountUsdc, amountSusd) = IVelodromeRouter(velodromeRouter)
-            .quoteRemoveLiquidity(
-                address(usdc),
-                address(susd),
-                true, // stable pool
-                liquidity
-            );
+        if (_poolAmount == 0) {
+            return 0;
+        }
+
+        //amount of want and other for a given amount of LP token
+        (uint256 amountToken0, uint256 amountToken1) = balancesOfPool(
+            _poolAmount
+        );
+        uint256 toSwap;
+
+        // determine which token we need to swap
+        if (wantIsToken0()) {
+            toSwap = amountToken1;
+            totalWant = amountToken0;
+        } else {
+            toSwap = amountToken0;
+            totalWant = amountToken1;
+        }
+
+        // check what we get swapping other for more want
+        totalWant += pool.getAmountOut(toSwap, address(other));
     }
 
-    // this treats usdc and susd as 1:1
-    function estimatedTotalAssets() public view override returns (uint256) {
-        uint256 lpTokens = balanceOfLPTotal();
+    function wantToPoolToken(uint256 _wantAmount)
+        public
+        view
+        returns (uint256 totalPoolToken)
+    {
+        if (_wantAmount == 0) {
+            return 0;
+        }
 
-        (uint256 amountUsdc, uint256 amountSusd) = balanceOfConstituents(
-            lpTokens
+        // if volatile, just do 50/50
+        uint256 amountToKeep = _wantAmount / 2;
+        uint256 amountToSwap = _wantAmount - amountToKeep;
+
+        // if stable, do some more fancy math, not as easy as swapping half
+        if (isStablePool) {
+            uint256 ratio = router.quoteStableLiquidityRatio(
+                address(other),
+                address(want),
+                factory
+            );
+            amountToKeep = (_wantAmount * ratio) / 1e18; // ratio returned is B / (B + A)
+            amountToSwap = _wantAmount - amountToKeep;
+        }
+        uint256 theoreticalOtherAmount = pool.getAmountOut(
+            amountToSwap,
+            address(want)
         );
 
-        return	
-            amountSusd.add(balanceOfSusd()).add(balanceOfWant()).add(	
-                amountUsdc
-            );
+        // check what we get swapping other for more want
+        (, , totalPoolToken) = router.quoteAddLiquidity(
+            address(other),
+            address(want),
+            isStablePool,
+            factory,
+            theoreticalOtherAmount,
+            amountToKeep
+        );
+    }
+
+    function balancesOfPool(uint256 _liquidity)
+        public
+        view
+        returns (uint256 amount0, uint256 amount1)
+    {
+        (amount0, amount1) = router.quoteRemoveLiquidity(
+            address(poolToken0),
+            address(poolToken1),
+            isStablePool,
+            _liquidity
+        );
+    }
+
+    function poolTokensInYVault() public view returns (uint256) {
+        uint256 balance = yvToken.balanceOf(address(this));
+
+        if (yvToken.totalSupply() == 0) {
+            //needed because of revert on priceperfullshare if 0
+            return 0;
+        }
+
+        uint256 pricePerShare = yvToken.pricePerShare();
+
+        // velo tokens are 1e18 decimals
+        return (balance * pricePerShare) / 1e18;
+    }
+
+    // first get amount of LP tokens we have, then want+non-want in strategy
+    function estimatedTotalAssets() public view override returns (uint256) {
+        uint256 totalCurveTokens = poolTokensInYVault() +
+            pool.balanceOf(address(this));
+        return balanceOfWant() + veloPoolToWant(totalCurveTokens);
     }
 
     /* ========== MUTATIVE FUNCTIONS ========== */
@@ -236,64 +505,42 @@ contract Strategy is BaseStrategy {
             uint256 _debtPayment
         )
     {
-        // claim our VELO rewards
-        // but what if we need to claim other tokens??? sweep???
-        gauge.getReward(address(this), address(velo));
-
-        uint256 veloBalance = velo.balanceOf(address(this));
-
-        // sell our claimed VELO rewards for USDC
-        if (veloBalance > 0) {
-            _sellVelo(veloBalance);
-        }
-        
-        uint256 assets = estimatedTotalAssets();
-        uint256 wantBal = balanceOfWant();
+        _debtPayment = _debtOutstanding;
 
         uint256 debt = vault.strategies(address(this)).totalDebt;
-        uint256 amountToFree;
+        uint256 currentValue = estimatedTotalAssets();
+        uint256 wantBalance = want.balanceOf(address(this));
 
-        if (assets >= debt) {
-            _debtPayment = _debtOutstanding;
-            _profit = assets.sub(debt);
-
-            amountToFree = _profit.add(_debtPayment);
+        if (debt < currentValue) {
+            //profit
+            _profit = currentValue - debt;
         } else {
-            //loss should never happen. so leave blank. small potential for IP i suppose. lets not record if so and handle manually
-            //dont withdraw either incase we realise losses
-            //withdraw with loss
-            if (realiseLosses) {
-                _loss = debt.sub(assets);
-                if (_debtOutstanding > _loss) {	
-                    _debtPayment = _debtOutstanding.sub(_loss);	
-                } else {	
-                    _debtPayment = 0;	
-                }
-
-                amountToFree = _debtPayment;
-            }
+            _loss = debt - currentValue;
         }
 
-        if (wantBal < amountToFree) {
-            // should this be amountToFree.sub(wantBal)???
-            liquidatePosition(amountToFree);
+        uint256 toFree = _debtPayment + _profit;
 
-            uint256 newLoose = balanceOfWant();
+        if (toFree > wantBalance) {
+            toFree = toFree - wantBalance;
 
-            // if we dont have enough money adjust _debtOutstanding and only change profit if needed
-            // i'm not 100% sure what's going on here
-            if (newLoose < amountToFree) {
-                if (_profit > newLoose) {
-                    _profit = newLoose;
-                    _debtPayment = 0;
-                } else {
-                    _debtPayment = Math.min(newLoose - _profit, _debtPayment);
-                }
+            (, uint256 withdrawalLoss) = withdrawSome(toFree);
+            //when we withdraw we can lose money in the withdrawal
+            if (withdrawalLoss < _profit) {
+                _profit = _profit - withdrawalLoss;
+            } else {
+                _loss = _loss + (withdrawalLoss - _profit);
+                _profit = 0;
+            }
+
+            wantBalance = want.balanceOf(address(this));
+
+            if (wantBalance < _profit) {
+                _profit = wantBalance;
+                _debtPayment = 0;
+            } else if (wantBalance < _debtPayment + _profit) {
+                _debtPayment = wantBalance - _profit;
             }
         }
-
-        // we're done harvesting, so reset our trigger if we used it
-        forceHarvestTriggerOnce = false;
     }
 
     function adjustPosition(uint256 _debtOutstanding) internal override {
@@ -301,235 +548,220 @@ contract Strategy is BaseStrategy {
             return;
         }
 
-        // first we get the balance of each token in the pool
-        // DONT FORGET: usdc (6 decimals), susd (18 decimals)
-        uint256 usdcB = usdc.balanceOf(velodromePoolAddress).mul(1e12); // (now 18 decimals)
-        uint256 susdB = susd.balanceOf(velodromePoolAddress);
-        uint256 poolBalance = usdcB.add(susdB);
-        uint256 amountIn = poolBalance.div(20); // 5% of poolBalance
+        if (lastInvest + minTimePerInvest > block.timestamp) {
+            return;
+        }
 
-        // because it is a stable pool, lets check slippage by doing a trade against it.
-        route memory usdcToSusd = route(
-            address(usdc),
-            address(susd),
-            true
+        // Invest the rest of the want
+        uint256 _wantToInvest = Math.min(
+            want.balanceOf(address(this)),
+            maxSingleInvest
         );
-
-        // check usdc to susd slippage
-        route[] memory routes = new route[](1);
-        routes[0] = usdcToSusd;
-        uint256 amountOut = IVelodromeRouter(velodromeRouter).getAmountsOut(
-            amountIn, // swap 5% of poolBalance
-            routes
-        )[1];
-
-        // allow up to 0.2% slippage on a swap of 5% of the poolBalance by default
-        if (amountOut < amountIn.mul(lpSlippage).div(DENOMINATOR)) {
-            // dont do anything because we would be lping into the pool at a bad price
+        if (_wantToInvest == 0) {
             return;
         }
 
-        // send all of our want tokens to be deposited
-        uint256 usdcBal = balanceOfWant().mul(1e12); // now to 18 decimals (example, 1m)
-        uint256 susdBal = balanceOfSusd();
+        // deposit to our pool
+        _depositToPool(_wantToInvest);
 
-        // dont bother for less than 10000 usdc
-        if (usdcBal.add(susdBal) < 1e22) {
-            return;
+        // deposit to yearn vault
+        yvToken.deposit();
+        lastInvest = block.timestamp;
+    }
+
+    // DONE AND UPDATED
+    function _depositToPool(uint256 _wantAmount) internal {
+        // if volatile, just do 50/50
+        uint256 amountToKeep = _wantAmount / 2;
+        uint256 amountToSwap = _wantAmount - amountToKeep;
+
+        // if stable, do some more fancy math, not as easy as swapping half
+        if (isStablePool) {
+            uint256 ratio = router.quoteStableLiquidityRatio(
+                address(other),
+                address(want),
+                factory
+            );
+            amountToKeep = (_wantAmount * ratio) / 1e18; // ratio returned is B / (B + A)
+            amountToSwap = _wantAmount - amountToKeep;
         }
-        
-        // first we get the ratio of each token in the pool. this determines how many we need of each
-        // DONT FORGET: usdc (6 decimals), susd (18 decimals)
-        uint256 usdcB = usdc.balanceOf(velodromePoolAddress).mul(1e12); // 5m (18 decimals)
-        uint256 susdB = susd.balanceOf(velodromePoolAddress); // 5m (18 decimals)
 
-        uint256 susdWeNeed = usdcBal.mul(susdB).div(usdcB.add(susdB)); // 500k (18 decimals)
-        uint256 susdWeNeedInUsdc = susdWeNeed.div(1e12);
-        uint256 usdcWeHaveToSwap = susdWeNeedInUsdc.sub(susdBal);
-        uint256 usdcToSwap = math.min(usdcWeHaveToSwap, amountIn.div(1e12)); // amountIn = 5% of pool (converted back to 6 decimals)
+        // should have a slippage limit here on swaps between want -> other *********
+        uint256 minOtherOut = pool.getAmountOut(amountToSwap, address(want)) *
+            ((DENOMINATOR - slippageProtectionIn) / DENOMINATOR);
 
-        IVelodromeRouter(velodromeRouter).swapExactTokensForTokens(
-            usdcToSwap,
-            uint256(0),
-            routes,
+        // swap want to other
+        router.swapExactTokensForTokens(
+            amountToSwap,
+            minOtherOut,
+            swapRouteForOther,
             address(this),
             block.timestamp
-        )[1];
-        
-        usdcBalNew = balanceOfWant();
-        susdBalNew = balanceOfSusd();
+        );
 
-        if (anyWftmBal > 0 && wftmBal > 0) {
-            // deposit into lp
-            ISolidlyRouter(solidlyRouter).addLiquidity(
-                address(usdc),
-                address(susd),
-                true,
-                usdcBalNew,
-                susdBalNew,
-                0,
-                0,
+        // check and see what we have after swaps
+        uint256 wantBalance = want.balanceOf(address(this));
+        uint256 otherBalance = other.balanceOf(address(this));
+
+        // calc our want and other minimums
+        uint256 wantMin = wantBalance *
+            ((DENOMINATOR - slippageProtectionIn) / DENOMINATOR);
+        uint256 otherMin = otherBalance *
+            ((DENOMINATOR - slippageProtectionIn) / DENOMINATOR);
+
+        // deposit our liquidity, should have minimal remaining in strategy after this
+        router.addLiquidity(
+            address(want),
+            address(other),
+            isStablePool,
+            wantBalance,
+            otherBalance,
+            wantMin,
+            otherMin,
+            address(this),
+            block.timestamp
+        );
+    }
+
+    //safe to enter more than we have
+    function withdrawSome(uint256 _amount)
+        internal
+        returns (uint256 _liquidatedAmount, uint256 _loss)
+    {
+        uint256 wantBalanceBefore = want.balanceOf(address(this));
+
+        //let's take the amount we need if virtual price is real. Let's add the
+        uint256 poolTokensNeeded = wantToPoolToken(_amount);
+
+        uint256 poolBeforeBalance = pool.balanceOf(address(this)); //should be zero but just incase...
+
+        uint256 pricePerFullShare = yvToken.pricePerShare();
+        uint256 amountFromVault = (poolTokensNeeded * 1e18) / pricePerFullShare;
+
+        uint256 yBalance = yvToken.balanceOf(address(this));
+
+        if (amountFromVault > yBalance) {
+            amountFromVault = yBalance;
+            //this is not loss. so we amend amount
+
+            uint256 _poolTokens = (amountFromVault * pricePerFullShare) / 1e18;
+            _amount = veloPoolToWant(_poolTokens);
+        }
+
+        if (amountFromVault > 0) {
+            yvToken.withdraw(amountFromVault);
+            if (withdrawProtection) {
+                //this tests that we liquidated all of the expected ytokens. Without it if we get back less then will mark it is loss
+                require(
+                    yBalance - yvToken.balanceOf(address(this)) >=
+                        amountFromVault - (1),
+                    "YVAULTWITHDRAWFAILED"
+                );
+            }
+        }
+
+        uint256 toWithdraw = pool.balanceOf(address(this)) - poolBeforeBalance;
+
+        if (toWithdraw > 0) {
+            // here we should quote our liquidity out to get a best estimate of what we should be getting
+            (uint256 wantMin, uint256 otherMin) = balancesOfPool(toWithdraw);
+
+            //if we have less than 18 decimals we need to lower the amount out
+            wantMin =
+                (toWithdraw * (DENOMINATOR - (slippageProtectionOut))) /
+                (DENOMINATOR);
+            if (want_decimals < 18) {
+                wantMin = wantMin / (10**(uint256(uint8(18) - want_decimals)));
+            }
+
+            otherMin =
+                (otherMin * (DENOMINATOR - (slippageProtectionOut))) /
+                (DENOMINATOR);
+            if (other_decimals < 18) {
+                otherMin =
+                    otherMin /
+                    (10**(uint256(uint8(18) - other_decimals)));
+            }
+
+            // time for the yoink
+            router.removeLiquidity(
+                address(want),
+                address(other),
+                isStablePool,
+                toWithdraw,
+                wantMin,
+                otherMin,
                 address(this),
-                2**256 - 1
+                block.timestamp
             );
         }
-    
-        uint256 lpBalance = balanceOfLPUnstaked();
 
-        if (lpBalance > 0) {
-            // deposit to gauge
-            gauge.deposit(lpBalance);
+        // swap our other to want
+        uint256 otherBalance = other.balanceOf(address(this));
+        uint256 minWantOut = pool.getAmountOut(otherBalance, address(other)) *
+            ((DENOMINATOR - slippageProtectionOut) / DENOMINATOR);
+
+        // swap other to want
+        router.swapExactTokensForTokens(
+            otherBalance,
+            minWantOut,
+            swapRouteForWant,
+            address(this),
+            block.timestamp
+        );
+
+        uint256 diff = want.balanceOf(address(this)) - (wantBalanceBefore);
+
+        if (diff > _amount) {
+            _liquidatedAmount = _amount;
+        } else {
+            _liquidatedAmount = diff;
+            _loss = _amount - (diff);
         }
     }
 
-    // returns lp tokens needed to get that amount of usdc
-    function usdcToLpTokens(uint256 amountOfYfiWeWant) public returns (uint256) {
-        //amount of usdc and susd for 1 lp token
-        (uint256 amountYfiPerLp, uint256 amountWoofy) = balanceOfConstituents(
-            1e18
-        );
-
-        //1 lp token is this amount of yfi
-        amountYfiPerLp = amountYfiPerLp.add(amountWoofy);
-
-        uint256 lpTokensWeNeed = amountOfYfiWeWant.mul(1e18).div(
-            amountYfiPerLp
-        );
-
-        return lpTokensWeNeed;
-    }
-
+    // ssc version
     function liquidatePosition(uint256 _amountNeeded)
         internal
         override
         returns (uint256 _liquidatedAmount, uint256 _loss)
     {
-        uint256 balanceOfUsdc = balanceOfWant();
-
-        // if we need more usdc than is already loose in the strategy
-        if (balanceOfUsdc < _amountNeeded) {
-            // amountToFree = the usdc needed beyond any usdc that is already loose in the strategy
-            uint256 amountToFree = _amountNeeded.sub(balanceOfUsdc);
-
-            if (amountToFree > dustThreshold) {
-                // converts this amount into lpTokens
-                uint256 lpTokensNeeded = usdcToLpTokens(amountToFree);
-
-                uint256 balanceOfUnstaked = balanceOfLPUnstaked();
-
-                if (balanceOfUnstaked < lpTokensNeeded) {
-                    uint256 amountToUnstake = lpTokensNeeded.sub(
-                        balanceOfUnstaked
-                    );
-
-                    // balance of lp tokens staked in gauge
-                    uint256 balanceOfStaked = balanceOfLPStaked();
-                    if (balanceOfStaked > 0) {
-                        // Withdraw lp tokens from gauge	
-                        gauge.withdraw(Math.min(amountToUnstake, balanceOfStaked));
-                    }
-
-                    balanceOfLpTokens = balanceOfLPUnstaked();
-                }
-
-                if (balanceOfLpTokens > 0) {
-                    IVelodromeRouter(velodromeRouter).removeLiquidity(
-                        address(usdc),
-                        address(susd),
-                        true,
-                        Math.min(lpTokensNeeded, balanceOfLpTokens),
-                        0,
-                        0,
-                        address(this),
-                        type(uint256).max
-                    );
-                }
-
-                balanceOfUsdc = balanceOfWant();
-
-                _liquidatedAmount = Math.min(balanceOfUsdc, _amountNeeded);
-
-                if (_liquidatedAmount < _amountNeeded) {
-                    _loss = _amountNeeded.sub(_liquidatedAmount);
-                }
-            }
-        } else {
-            _liquidatedAmount = _amountNeeded;
-        }
-    }
-
-    function liquidateAllPositions() internal override returns (uint256) {
-        // balance of lp tokens staked in gauge	
-        uint256 balanceOfStaked = balanceOfLPStaked();	
-        if (balanceOfStaked > 0) {	
-            // Withdraw lp tokens from gauge	
-            gauge.withdraw(staked);	
+        uint256 wantBal = want.balanceOf(address(this));
+        if (wantBal < _amountNeeded) {
+            (_liquidatedAmount, _loss) = withdrawSome(
+                _amountNeeded - (wantBal)
+            );
         }
 
-        balanceOfLpTokens = balanceOfLPUnstaked();
-
-        IVelodromeRouter(velodromeRouter).removeLiquidity(
-            address(usdc),
-            address(susd),
-            true,
-            balanceOfLPTokens,
-            0,
-            0,
-            address(this),
-            type(uint256).max
+        _liquidatedAmount = Math.min(
+            _amountNeeded,
+            _liquidatedAmount + wantBal
         );
-        
-        return balanceOfWant();
     }
 
-    // Sells our harvested VELO into the selected output (USDC)
-    function _sellVelo(uint256 _veloAmount) internal {
-        IVelodromeRouter(velodromeRouter).swapExactTokensForTokens(
-            _veloAmount,
-            uint256(0),
-            veloTokenPath,
-            address(this),
-            block.timestamp
-        );
+    function liquidateAllPositions()
+        internal
+        override
+        returns (uint256 _amountFreed)
+    {
+        (_amountFreed, ) = liquidatePosition(1e36); //we can request a lot. dont use max because of overflow
     }
 
     function prepareMigration(address _newStrategy) internal override {
-        if (!depositerAvoid) {
-            // our balance of velodrome lp tokens staked in gauge	
-            uint256 staked = balanceOfLPStaked();	
-            if (staked > 0) {	
-                // Withdraw oxLP from multiRewards	
-                gauge.withdraw(staked);	
-            }
+        uint256 to_transfer = yvToken.balanceOf(address(this));
+        if (to_transfer > 0) {
+            yvToken.transfer(_newStrategy, to_transfer);
         }
 
-        uint256 lpBalance = balanceOfLPUnstaked();
-
-        if (lpBalance > 0) {
-            IERC20(solidPoolAddress).safeTransfer(_newStrategy, lpBalance);
+        to_transfer = pool.balanceOf(address(this));
+        if (to_transfer > 0) {
+            pool.transfer(_newStrategy, to_transfer);
         }
 
-        uint256 susdBalance = balanceOfSusd();
-
-        if (susdBalance > 0) {
-            // send our total balance of woofy to the new strategy
-            susd.transfer(_newStrategy, susdBalance);
+        to_transfer = other.balanceOf(address(this));
+        if (to_transfer > 0) {
+            other.transfer(_newStrategy, to_transfer);
         }
-    }
-
-    // Withdraw velodrome LP token from gauge	
-    function manualUnstake(uint256 amount)
-        external	
-        onlyEmergencyAuthorized	
-    {	
-        _manualUnstake(amount);
-    }
-
-    // Withdraw velodrome LP token from gauge	
-    function _manualUnstake(uint256 amount)
-        internal	
-    {	
-        gauge.withdraw(amount);
     }
 
     function protectedTokens()
@@ -539,57 +771,85 @@ contract Strategy is BaseStrategy {
         returns (address[] memory)
     {}
 
+    /// @notice Calculates the profit if all claimable assets were sold for USDC (6 decimals).
+    /// @dev Uses yearn's lens oracle, if returned values are strange then troubleshoot there.
+    /// @return Total return in USDC from taking profits on yToken gains.
+    function claimableProfitInUsdc() public view returns (uint256) {
+        IOracle yearnOracle = IOracle(
+            0xB082d9f4734c535D9d80536F7E87a6f4F471bF65
+        ); // yearn lens oracle, need optimism address
+        uint256 underlyingPrice = yearnOracle.getPriceUsdcRecommended(
+            address(want)
+        );
+
+        // Oracle returns prices as 6 decimals, so multiply by claimable amount and divide by token decimals
+        return
+            (claimableProfits() * underlyingPrice) / (10**yvToken.decimals());
+    }
+
+    function ethToWant(uint256 _amtInWei)
+        public
+        view
+        override
+        returns (uint256)
+    {}
+
     /* ========== SETTERS ========== */
 
-    ///@notice This allows us to manually harvest with our keeper as needed
-    function setForceHarvestTriggerOnce(bool _forceHarvestTriggerOnce)
-        external
-        onlyEmergencyAuthorized
-    {
-        forceHarvestTriggerOnce = _forceHarvestTriggerOnce;
-    }
+    // router
+    // These functions are useful for setting parameters of the strategy that may need to be adjusted.
 
-    ///@notice When our strategy has this much credit, harvestTrigger will be true.
-    function setMinHarvestCredit(uint256 _minHarvestCredit)
-        external
-        onlyEmergencyAuthorized
-    {
-        minHarvestCredit = _minHarvestCredit;
-    }
+    /// @notice Set the maximum loss we will accept (due to slippage or locked funds) on a vault withdrawal.
+    /// @dev Generally, this should be zero, and this function will only be used in special/emergency cases.
+    /// @param _maxLoss Max percentage loss we will take, in basis points (100% = 10_000).
+    //     function setMaxLoss(uint256 _maxLoss) public onlyVaultManagers {
+    //         maxLoss = _maxLoss;
+    //     }
 
-    ///@notice When our strategy has this much credit, harvestTrigger will be true.
-    function setRealiseLosses(bool _realiseLoosses)
+    /// @notice This allows us to set the dust threshold for our strategy.
+    /// @param _dustThreshold This sets what dust is. If we have less than this remaining after withdrawing, accept it as a loss.
+    function setDustThreshold(uint256 _dustThreshold)
         external
         onlyVaultManagers
     {
-        realiseLosses = _realiseLoosses;
+        require(_dustThreshold < 10000, "Your size is too much size");
+        dustThreshold = _dustThreshold;
     }
 
-    function setLpSlippage(uint256 _slippage) external onlyEmergencyAuthorized {
-        _setLpSlippage(_slippage, false);
-    }
+    // from our SSC strategy
 
-    //only vault managers can set high slippage
-    function setLpSlippage(uint256 _slippage, bool _force)
-        external
+    function updateMinTimePerInvest(uint256 _minTimePerInvest)
+        public
         onlyVaultManagers
     {
-        _setLpSlippage(_slippage, _force);
+        minTimePerInvest = _minTimePerInvest;
     }
 
-    function _setLpSlippage(uint256 _slippage, bool _force) internal {
-        require(_slippage <= DENOMINATOR, "higher than max");
-        if (!_force) {
-            require(_slippage >= 9900, "higher than 1pc slippage set");
-        }
-        lpSlippage = _slippage;
+    function updateMaxSingleInvest(uint256 _maxSingleInvest)
+        public
+        onlyVaultManagers
+    {
+        maxSingleInvest = _maxSingleInvest;
     }
 
-    function setDepositerAvoid(bool _avoid) external onlyGovernance {
-        depositerAvoid = _avoid;
+    function updateSlippageProtectionIn(uint256 _slippageProtectionIn)
+        public
+        onlyVaultManagers
+    {
+        slippageProtectionIn = _slippageProtectionIn;
     }
 
-    function setDustThreshold(uint256 _dust) external onlyEmergencyAuthorized {
-        dustThreshold = _dust;
+    function updateSlippageProtectionOut(uint256 _slippageProtectionOut)
+        public
+        onlyVaultManagers
+    {
+        slippageProtectionOut = _slippageProtectionOut;
+    }
+
+    function updateWithdrawProtection(bool _withdrawProtection)
+        public
+        onlyVaultManagers
+    {
+        withdrawProtection = _withdrawProtection;
     }
 }

@@ -1,194 +1,105 @@
 import brownie
-from brownie import Contract
-import time
-import web3
-from eth_abi import encode_single, encode_abi
-from brownie.convert import to_bytes
-from eth_abi.packed import encode_abi_packed
-import eth_utils
+from brownie import ZERO_ADDRESS, interface, chain
+from utils import harvest_strategy
 
-
-def test_yswap(
+# test our permissionless swaps and our trade handler functions as intended
+def test_keepers_and_trade_handler(
     gov,
-    liveBooStrat,
-    wftm,
-    amount,
-    Contract,
-    ymechs_safe,
-    chain,
-    accounts,
-    solidex_router,
-    strategy,
     token,
-    whale,
     vault,
-    interface,
-    spooky_router,
-    trade_factory,
-    oxd,
-    solid,
-    multicall_swapper,
-    strategist_ms
+    whale,
+    strategy,
+    amount,
+    sleep_time,
+    profit_whale,
+    profit_amount,
+    target,
+    use_yswaps,
+    keeper_wrapper,
 ):
+    # no testing needed if we're not using yswaps
+    if not use_yswaps:
+        return
 
-    print("CallOnlyOptimizationRequired(): ", eth_utils.to_hex(
-        eth_utils.function_signature_to_4byte_selector("CallOnlyOptimizationRequired()")))
-    print("InvalidSwapper(): ", eth_utils.to_hex(
-        eth_utils.function_signature_to_4byte_selector("InvalidSwapper()")))
-    print("SwapperInUse(): ", eth_utils.to_hex(
-        eth_utils.function_signature_to_4byte_selector("SwapperInUse()")))
-    print("NotAsyncSwapper(): ", eth_utils.to_hex(
-        eth_utils.function_signature_to_4byte_selector("NotAsyncSwapper()")))
-    print("MultiCallRevert(): ", eth_utils.to_hex(
-        eth_utils.function_signature_to_4byte_selector("MultiCallRevert()")))
-    print("ZeroAddress(): ", eth_utils.to_hex(
-        eth_utils.function_signature_to_4byte_selector("ZeroAddress()")))
-    print("NotAuthorized(): ", eth_utils.to_hex(
-        eth_utils.function_signature_to_4byte_selector("NotAuthorized()")))
-    print("IncorrectSwapInformation(): ", eth_utils.to_hex(
-        eth_utils.function_signature_to_4byte_selector("IncorrectSwapInformation()")))
-    print("ZeroSlippage(): ", eth_utils.to_hex(
-        eth_utils.function_signature_to_4byte_selector("ZeroSlippage()")))
-
-    # prob needs changing a lot
-    strategist = accounts.at(strategy.strategist(), force=True)
-
-    gov = accounts.at(vault.governance(), force=True)
-    # trade_factory.grantRole(
-    #     trade_factory.STRATEGY(), strategy, {
-    #         "from": ymechs_safe, "gas_price": "0 gwei"}
-    # )
-    # trade_factory.addSwappers([multicall_swapper], {"from": ymechs_safe})
-    # strategy.updateTradeFactory(trade_factory, {'from': gov})
-
-    startingWhale = token.balanceOf(whale)
-    token.approve(vault, 2 ** 256 - 1, {"from": whale})
+    ## deposit to the vault after approving
+    starting_whale = token.balanceOf(whale)
+    token.approve(vault, 2**256 - 1, {"from": whale})
     vault.deposit(amount, {"from": whale})
-    strategy.harvest({"from": strategist})
-    # simulate 12 hours of earnings
-    chain.sleep(43200)
+    newWhale = token.balanceOf(whale)
+
+    # harvest, store asset amount
+    (profit, loss, extra) = harvest_strategy(
+        use_yswaps,
+        strategy,
+        token,
+        gov,
+        profit_whale,
+        profit_amount,
+        target,
+    )
+
+    # simulate profits
+    chain.sleep(sleep_time)
     chain.mine(1)
 
-    vault_before = strategy.estimatedTotalAssets()
-    strat_before = token.balanceOf(strategy)
-
-    strategy.harvest({"from": strategist})
-
-    token_out = token
-
-    id = solid
-
-    print(f"Executing trades...")
-
-    print(id.address)
-    receiver = strategy.address
-    token_in = id
-
-    amount_in = id.balanceOf(strategy)
-    print(
-        f"Executing trade {id}, tokenIn: {token_in} -> tokenOut {token_out} amount {amount_in/1e18}")
-
-    asyncTradeExecutionDetails = [
-        strategy, token_in, token_out, amount_in, 1]
-
-    optimsations = [["uint8"], [5]]
-    a = optimsations[0]
-    b = optimsations[1]
-
-    # send all our tokens
-    calldata = token_in.approve.encode_input(solidex_router, amount_in)
-    t = createTx(token_in, calldata)
-    a = a + t[0]
-    b = b + t[1]
-
-    step = [token_in.address, wftm, False]
-    path = [step]
-
-    expectedOut = solidex_router.getAmountsOut(amount_in, path)[1]
-
-    calldata = solidex_router.swapExactTokensForTokens.encode_input(
-        amount_in, 0, path, receiver, 2 ** 256 - 1
+    # harvest, store new asset amount
+    (profit, loss, extra) = harvest_strategy(
+        use_yswaps,
+        strategy,
+        token,
+        gov,
+        profit_whale,
+        profit_amount,
+        target,
     )
-    t = createTx(solidex_router, calldata)
-    a = a + t[0]
-    b = b + t[1]
 
-    transaction = encode_abi_packed(a, b)
+    # set our keeper up
+    strategy.setKeeper(keeper_wrapper, {"from": gov})
 
-    # min out must be at least 1 to ensure that the tx works correctly
-    # trade_factory.execute["uint256, address, uint, bytes"](
-    #    multicall_swapper.address, 1, transaction, {"from": ymechs_safe}
-    # )
-    trade_factory.execute['tuple,address,bytes'](asyncTradeExecutionDetails,
-                                                 multicall_swapper.address, transaction, {
-                                                     "from": ymechs_safe}
-                                                 )
+    # here we make sure we can harvest through our keeper wrapper
+    keeper_wrapper.harvest(strategy, {"from": profit_whale})
+    print("Keeper wrapper harvest works")
 
-    afterone = token_out.balanceOf(strategy)
-    print(afterone/1e18)
-    # now do oxd
+    ####### ADD LOGIC AS NEEDED FOR SENDING REWARDS TO STRATEGY #######
+    # send our strategy some CRV. normally it would be sitting waiting for trade handler but we automatically process it
+    crv = interface.IERC20(strategy.crv())
+    crv.transfer(strategy, 100e18, {"from": crv_whale})
 
-    id = oxd
+    # whale can't sweep, but trade handler can
+    with brownie.reverts():
+        crv.transferFrom(strategy, whale, crv.balanceOf(strategy) / 2, {"from": whale})
 
-    # wftmboopair = Contract(
-    #     '0xEc7178F4C41f346b2721907F5cF7628E388A7a58')  # spookylp
-    # sexwftmpair = Contract(
-    #     '0xFCEC86aF8774d69e2e4412B8De3f4aBf1f671ecC')  # volatile amm pair
-
-    print(f"Executing trades...")
-
-    print(id.address)
-    receiver = strategy.address
-    token_in = id
-
-    amount_in = id.balanceOf(strategy)
-    print(
-        f"Executing trade {id}, tokenIn: {token_in} -> tokenOut {token_out} amount {amount_in/1e18}")
-
-    asyncTradeExecutionDetails = [
-        strategy, token_in, token_out, amount_in, 1]
-
-    optimsations = [["uint8"], [5]]
-    a = optimsations[0]
-    b = optimsations[1]
-
-    # send all our tokens
-    calldata = token_in.approve.encode_input(solidex_router, amount_in)
-    t = createTx(token_in, calldata)
-    a = a + t[0]
-    b = b + t[1]
-
-    step = [token_in.address, wftm, False]
-    path = [step]
-
-    expectedOut = solidex_router.getAmountsOut(amount_in, path)[1]
-
-    calldata = solidex_router.swapExactTokensForTokens.encode_input(
-        amount_in, 0, path, receiver, 2 ** 256 - 1
+    crv.transferFrom(
+        strategy, whale, crv.balanceOf(strategy) / 2, {"from": trade_factory}
     )
-    t = createTx(solidex_router, calldata)
-    a = a + t[0]
-    b = b + t[1]
 
-    transaction = encode_abi_packed(a, b)
+    # remove our trade handler
+    strategy.removeTradeFactoryPermissions(True, {"from": gov})
+    assert strategy.tradeFactory() == ZERO_ADDRESS
+    assert crv.balanceOf(strategy) > 0
 
-    trade_factory.execute['tuple,address,bytes'](asyncTradeExecutionDetails,
-                                                 multicall_swapper.address, transaction, {
-                                                     "from": ymechs_safe}
-                                                 )
+    # trade factory now cant sweep
+    with brownie.reverts():
+        crv.transferFrom(
+            strategy, whale, crv.balanceOf(strategy) / 2, {"from": trade_factory}
+        )
 
-    aftertwo = token_out.balanceOf(strategy)
-    print(aftertwo/1e18)
-    assert aftertwo > afterone
-    strategy.setDoHealthCheck(False, {"from": gov})
-    tx = strategy.harvest({"from": strategist})
-    print('profit: ', tx.events["Harvested"]["profit"]/1e18)
-    assert tx.events["Harvested"]["profit"] > 0
+    # give back those permissions, now trade factory can sweep
+    strategy.updateTradeFactory(trade_factory, {"from": gov})
+    crv.transferFrom(
+        strategy, whale, crv.balanceOf(strategy) / 2, {"from": trade_factory}
+    )
 
-    print("apr = ", 100 *
-          (365*2*tx.events["Harvested"]["profit"]) / vault_before, "%")
+    # remove again!
+    strategy.removeTradeFactoryPermissions(False, {"from": gov})
 
+    # update again
+    strategy.updateTradeFactory(trade_factory, {"from": gov})
 
-def createTx(to, data):
-    inBytes = eth_utils.to_bytes(hexstr=data)
-    return [["address", "uint256", "bytes"], [to.address, len(inBytes), inBytes]]
+    # simulate profits
+    chain.sleep(sleep_time)
+    chain.mine(1)
+
+    # can't set trade factory to zero
+    with brownie.reverts():
+        strategy.updateTradeFactory(ZERO_ADDRESS, {"from": gov})

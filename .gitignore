@@ -11,3 +11,4 @@ node_modules/
 .DS_Store
 @openzeppelin
 @yearnvaults
+.DS_Store
