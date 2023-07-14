@@ -25,11 +25,6 @@ interface IVelodromeRouter {
         address factory;
     }
 
-    function getAmountsOut(uint256 amountIn, Routes[] memory routes)
-        external
-        view
-        returns (uint256[] memory amounts);
-
     function removeLiquidity(
         address tokenA,
         address tokenB,
@@ -95,20 +90,6 @@ interface IVelodromeRouter {
         address token1,
         address factory
     ) external view returns (uint256 ratio);
-}
-
-interface IVelodromeGauge {
-    function deposit(uint256 amount) external;
-
-    function balanceOf(address) external view returns (uint256);
-
-    function withdraw(uint256 amount) external;
-
-    function getReward(address account) external;
-
-    function earned(address account) external view returns (uint256);
-
-    function stakingToken() external view returns (address);
 }
 
 interface IVelodromePool is IERC20 {
@@ -403,9 +384,8 @@ abstract contract StrategySingleSidedVelodrome is BaseStrategy {
         }
 
         //amount of want and other for a given amount of LP token
-        (uint256 amountToken0, uint256 amountToken1) = balancesOfPool(
-            _poolAmount
-        );
+        (uint256 amountToken0, uint256 amountToken1) =
+            balancesOfPool(_poolAmount);
         uint256 toSwap;
 
         // determine which token we need to swap
@@ -436,18 +416,17 @@ abstract contract StrategySingleSidedVelodrome is BaseStrategy {
 
         // if stable, do some more fancy math, not as easy as swapping half
         if (isStablePool) {
-            uint256 ratio = router.quoteStableLiquidityRatio(
-                address(other),
-                address(want),
-                factory
-            );
+            uint256 ratio =
+                router.quoteStableLiquidityRatio(
+                    address(other),
+                    address(want),
+                    factory
+                );
             amountToKeep = (_wantAmount * ratio) / 1e18; // ratio returned is B / (B + A)
             amountToSwap = _wantAmount - amountToKeep;
         }
-        uint256 theoreticalOtherAmount = pool.getAmountOut(
-            amountToSwap,
-            address(want)
-        );
+        uint256 theoreticalOtherAmount =
+            pool.getAmountOut(amountToSwap, address(want));
 
         // check what we get swapping other for more want
         (, , totalPoolToken) = router.quoteAddLiquidity(
@@ -489,8 +468,8 @@ abstract contract StrategySingleSidedVelodrome is BaseStrategy {
 
     // first get amount of LP tokens we have, then want+non-want in strategy
     function estimatedTotalAssets() public view override returns (uint256) {
-        uint256 totalCurveTokens = poolTokensInYVault() +
-            pool.balanceOf(address(this));
+        uint256 totalCurveTokens =
+            poolTokensInYVault() + pool.balanceOf(address(this));
         return balanceOfWant() + veloPoolToWant(totalCurveTokens);
     }
 
@@ -553,10 +532,8 @@ abstract contract StrategySingleSidedVelodrome is BaseStrategy {
         }
 
         // Invest the rest of the want
-        uint256 _wantToInvest = Math.min(
-            want.balanceOf(address(this)),
-            maxSingleInvest
-        );
+        uint256 _wantToInvest =
+            Math.min(want.balanceOf(address(this)), maxSingleInvest);
         if (_wantToInvest == 0) {
             return;
         }
@@ -577,18 +554,20 @@ abstract contract StrategySingleSidedVelodrome is BaseStrategy {
 
         // if stable, do some more fancy math, not as easy as swapping half
         if (isStablePool) {
-            uint256 ratio = router.quoteStableLiquidityRatio(
-                address(other),
-                address(want),
-                factory
-            );
+            uint256 ratio =
+                router.quoteStableLiquidityRatio(
+                    address(other),
+                    address(want),
+                    factory
+                );
             amountToKeep = (_wantAmount * ratio) / 1e18; // ratio returned is B / (B + A)
             amountToSwap = _wantAmount - amountToKeep;
         }
 
         // should have a slippage limit here on swaps between want -> other *********
-        uint256 minOtherOut = pool.getAmountOut(amountToSwap, address(want)) *
-            ((DENOMINATOR - slippageProtectionIn) / DENOMINATOR);
+        uint256 minOtherOut =
+            pool.getAmountOut(amountToSwap, address(want)) *
+                ((DENOMINATOR - slippageProtectionIn) / DENOMINATOR);
 
         // swap want to other
         router.swapExactTokensForTokens(
@@ -604,10 +583,10 @@ abstract contract StrategySingleSidedVelodrome is BaseStrategy {
         uint256 otherBalance = other.balanceOf(address(this));
 
         // calc our want and other minimums
-        uint256 wantMin = wantBalance *
-            ((DENOMINATOR - slippageProtectionIn) / DENOMINATOR);
-        uint256 otherMin = otherBalance *
-            ((DENOMINATOR - slippageProtectionIn) / DENOMINATOR);
+        uint256 wantMin =
+            wantBalance * ((DENOMINATOR - slippageProtectionIn) / DENOMINATOR);
+        uint256 otherMin =
+            otherBalance * ((DENOMINATOR - slippageProtectionIn) / DENOMINATOR);
 
         // deposit our liquidity, should have minimal remaining in strategy after this
         router.addLiquidity(
@@ -698,8 +677,9 @@ abstract contract StrategySingleSidedVelodrome is BaseStrategy {
 
         // swap our other to want
         uint256 otherBalance = other.balanceOf(address(this));
-        uint256 minWantOut = pool.getAmountOut(otherBalance, address(other)) *
-            ((DENOMINATOR - slippageProtectionOut) / DENOMINATOR);
+        uint256 minWantOut =
+            pool.getAmountOut(otherBalance, address(other)) *
+                ((DENOMINATOR - slippageProtectionOut) / DENOMINATOR);
 
         // swap other to want
         router.swapExactTokensForTokens(
@@ -775,12 +755,10 @@ abstract contract StrategySingleSidedVelodrome is BaseStrategy {
     /// @dev Uses yearn's lens oracle, if returned values are strange then troubleshoot there.
     /// @return Total return in USDC from taking profits on yToken gains.
     function claimableProfitInUsdc() public view returns (uint256) {
-        IOracle yearnOracle = IOracle(
-            0xB082d9f4734c535D9d80536F7E87a6f4F471bF65
-        ); // yearn lens oracle, need optimism address
-        uint256 underlyingPrice = yearnOracle.getPriceUsdcRecommended(
-            address(want)
-        );
+        IOracle yearnOracle =
+            IOracle(0xB082d9f4734c535D9d80536F7E87a6f4F471bF65); // yearn lens oracle, need optimism address
+        uint256 underlyingPrice =
+            yearnOracle.getPriceUsdcRecommended(address(want));
 
         // Oracle returns prices as 6 decimals, so multiply by claimable amount and divide by token decimals
         return
