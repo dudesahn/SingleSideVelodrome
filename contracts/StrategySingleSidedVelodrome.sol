@@ -265,8 +265,6 @@ contract StrategySingleSidedVelodrome is BaseStrategy {
         return want.balanceOf(address(this));
     }
 
-    // from our SSC strategy
-
     function delegatedAssets() public view override returns (uint256) {
         return vault.strategies(address(this)).totalDebt;
     }
@@ -285,7 +283,7 @@ contract StrategySingleSidedVelodrome is BaseStrategy {
         }
     }
 
-    // returns value of total
+    /// @notice Pool to want
     function veloPoolToWant(uint256 _poolAmount)
         public
         view
@@ -461,60 +459,112 @@ contract StrategySingleSidedVelodrome is BaseStrategy {
 
     // DONE AND UPDATED
     function _depositToPool(uint256 _wantAmount) internal {
-        // if volatile, just do 50/50
+        // setup our routes
+        IVelodromeRouter.Route[] memory routesWant =
+            new IVelodromeRouter.Route[](0);
+        IVelodromeRouter.Route[] memory routesOther = swapRouteForOther;
+        address _want = address(want);
+        bool _isStablePool = isStablePool;
+
+        // for volatile, we can just do 50/50, but make sure we don't try to send more than we have
         uint256 amountToKeep = _wantAmount / 2;
         uint256 amountToSwap = _wantAmount - amountToKeep;
 
-        // if stable, do some more fancy math, not as easy as swapping half
-        if (isStablePool) {
+        if (_isStablePool) {
+            // stable pools need to consider reserves of the tokens in the pool (ratio)
             uint256 ratio =
                 router.quoteStableLiquidityRatio(
                     address(other),
-                    address(want),
+                    _want,
                     factory
                 );
-            amountToKeep = (_wantAmount * ratio) / 1e18; // ratio returned is B / (B + A)
+            amountToKeep = (_wantAmount * ratio) / 1e18;
             amountToSwap = _wantAmount - amountToKeep;
         }
 
-        // should have a slippage limit here on swaps between want -> other *********
-        uint256 minOtherOut =
-            pool.getAmountOut(amountToSwap, address(want)) *
-                ((DENOMINATOR - slippageProtectionIn) / DENOMINATOR);
+        // before we zap, guesstimate how much we should receive
+        uint256 theoreticalLiquidity = wantToPoolToken(_wantAmount);
 
-        // swap want to other
-        if (amountToSwap > 0) {
-            router.swapExactTokensForTokens(
+        // create our struct for using the router's zapIn
+        IVelodromeRouter.Zap memory zapInPool =
+            _createZapInParams(
+                address(other),
+                _want,
+                _isStablePool,
+                factory,
                 amountToSwap,
-                minOtherOut,
-                swapRouteForOther,
-                address(this),
-                block.timestamp
+                amountToKeep,
+                routesOther,
+                routesWant
             );
+
+        // zap it in!
+        uint256 realLiquidity =
+            router.zapIn(
+                _want,
+                amountToSwap,
+                amountToKeep,
+                zapInPool,
+                routesOther,
+                routesWant,
+                address(this),
+                false
+            );
+
+        // do a check
+        if (
+            (theoreticalLiquidity * (DENOMINATOR - slippageProtectionIn)) /
+                DENOMINATOR >
+            realLiquidity
+        ) {
+            revert("Not enough LP received");
         }
+    }
 
-        // check and see what we have after swaps
-        uint256 wantBalance = want.balanceOf(address(this));
-        uint256 otherBalance = other.balanceOf(address(this));
+    function _createZapInParams(
+        address tokenA,
+        address tokenB,
+        bool stable,
+        address _factory,
+        uint256 amountInA,
+        uint256 amountInB,
+        IVelodromeRouter.Route[] memory routesA,
+        IVelodromeRouter.Route[] memory routesB
+    ) internal view returns (IVelodromeRouter.Zap memory zap) {
+        (
+            uint256 amountOutMinA,
+            uint256 amountOutMinB,
+            uint256 amountAMin,
+            uint256 amountBMin
+        ) =
+            router.generateZapInParams(
+                tokenA,
+                tokenB,
+                stable,
+                _factory,
+                amountInA,
+                amountInB,
+                routesA,
+                routesB
+            );
 
-        // calc our want and other minimums
-        uint256 wantMin =
-            wantBalance * ((DENOMINATOR - slippageProtectionIn) / DENOMINATOR);
-        uint256 otherMin =
-            otherBalance * ((DENOMINATOR - slippageProtectionIn) / DENOMINATOR);
-
-        // deposit our liquidity, should have minimal remaining in strategy after this
-        router.addLiquidity(
-            address(want),
-            address(other),
-            isStablePool,
-            wantBalance,
-            otherBalance,
-            wantMin,
-            otherMin,
-            address(this),
-            block.timestamp
-        );
+        amountAMin =
+            (amountAMin * (DENOMINATOR - slippageProtectionIn)) /
+            DENOMINATOR;
+        amountBMin =
+            (amountBMin * (DENOMINATOR - slippageProtectionIn)) /
+            DENOMINATOR;
+        return
+            IVelodromeRouter.Zap(
+                tokenA,
+                tokenB,
+                stable,
+                _factory,
+                amountOutMinA,
+                amountOutMinB,
+                amountAMin,
+                amountBMin
+            );
     }
 
     //safe to enter more than we have
@@ -560,22 +610,13 @@ contract StrategySingleSidedVelodrome is BaseStrategy {
             // here we should quote our liquidity out to get a best estimate of what we should be getting
             (uint256 wantMin, uint256 otherMin) = balancesOfPool(toWithdraw);
 
-            //if we have less than 18 decimals we need to lower the amount out
             wantMin =
                 (wantMin * (DENOMINATOR - (slippageProtectionOut))) /
                 (DENOMINATOR);
-            if (want_decimals < 18) {
-                wantMin = wantMin / (10**(uint256(uint8(18) - want_decimals)));
-            }
 
             otherMin =
                 (otherMin * (DENOMINATOR - (slippageProtectionOut))) /
                 (DENOMINATOR);
-            if (other_decimals < 18) {
-                otherMin =
-                    otherMin /
-                    (10**(uint256(uint8(18) - other_decimals)));
-            }
 
             // time for the yoink
             router.removeLiquidity(
