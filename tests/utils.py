@@ -77,6 +77,12 @@ def check_status(
     strategy_debt_ratio = strategy_params["debtRatio"]
     strategy_assets = strategy.estimatedTotalAssets()
 
+    # check our want and other balance
+    other = interface.IERC20(strategy.other())
+    want = interface.IERC20(strategy.want())
+    print("\n🚨 Want Balance:", want.balanceOf(strategy) / 1e18, "🚨")
+    print("🚨 Other Balance:", other.balanceOf(strategy) / 1e18, "🚨\n")
+
     # print our stuff
     print("Vault Assets:", vault_assets)
     print("Strategy Debt Outstanding:", debt_outstanding)

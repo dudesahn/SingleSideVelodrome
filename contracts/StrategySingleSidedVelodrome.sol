@@ -4,8 +4,9 @@ pragma solidity ^0.8.15;
 // These are the core Yearn libraries
 import "@openzeppelin/contracts/utils/math/Math.sol";
 import "@yearnvaults/contracts/BaseStrategy.sol";
+import "./IVelodromeV2.sol";
 
-interface IERC20Extended {
+interface IERC20Extended is IERC20 {
     function decimals() external view returns (uint8);
 
     function name() external view returns (string memory);
@@ -15,96 +16,6 @@ interface IERC20Extended {
 
 interface IOracle {
     function getPriceUsdcRecommended(address) external view returns (uint256);
-}
-
-interface IVelodromeRouter {
-    struct Routes {
-        address from;
-        address to;
-        bool stable;
-        address factory;
-    }
-
-    function removeLiquidity(
-        address tokenA,
-        address tokenB,
-        bool stable,
-        uint256 liquidity,
-        uint256 amountAMin,
-        uint256 amountBMin,
-        address to,
-        uint256 deadline
-    ) external returns (uint256 amountA, uint256 amountB);
-
-    function quoteRemoveLiquidity(
-        address tokenA,
-        address tokenB,
-        bool stable,
-        uint256 liquidity
-    ) external view returns (uint256 amountA, uint256 amountB);
-
-    function quoteAddLiquidity(
-        address tokenA,
-        address tokenB,
-        bool stable,
-        address _factory,
-        uint256 amountADesired,
-        uint256 amountBDesired
-    )
-        external
-        view
-        returns (
-            uint256 amountA,
-            uint256 amountB,
-            uint256 liquidity
-        );
-
-    function addLiquidity(
-        address,
-        address,
-        bool,
-        uint256,
-        uint256,
-        uint256,
-        uint256,
-        address,
-        uint256
-    )
-        external
-        returns (
-            uint256 amountA,
-            uint256 amountB,
-            uint256 liquidity
-        );
-
-    function swapExactTokensForTokens(
-        uint256 amountIn,
-        uint256 amountOutMin,
-        Routes[] memory routes,
-        address to,
-        uint256 deadline
-    ) external returns (uint256[] memory amounts);
-
-    function quoteStableLiquidityRatio(
-        address token0,
-        address token1,
-        address factory
-    ) external view returns (uint256 ratio);
-}
-
-interface IVelodromePool is IERC20 {
-    function stable() external view returns (bool);
-
-    function token0() external view returns (address);
-
-    function token1() external view returns (address);
-
-    function factory() external view returns (address);
-
-    function getAmountOut(uint256 amountIn, address tokenIn)
-        external
-        view
-        returns (uint256 amount);
 }
 
 contract StrategySingleSidedVelodrome is BaseStrategy {
@@ -155,11 +66,11 @@ contract StrategySingleSidedVelodrome is BaseStrategy {
 
     /// @notice Our swap route to go from the other token in the pool to our want token.
     /// @dev Struct is from token, to token, and true/false for stable/volatile.
-    IVelodromeRouter.Routes[] public swapRouteForWant;
+    IVelodromeRouter.Route[] public swapRouteForWant;
 
     /// @notice Our swap route to go from our want token to the other token in the pool
     /// @dev Struct is from token, to token, and true/false for stable/volatile.
-    IVelodromeRouter.Routes[] public swapRouteForOther;
+    IVelodromeRouter.Route[] public swapRouteForOther;
 
     /// @notice Minimum profit size in USDC that we want to harvest.
     /// @dev Only used in harvestTrigger.
@@ -274,7 +185,7 @@ contract StrategySingleSidedVelodrome is BaseStrategy {
         other_decimals = IERC20Extended(address(other)).decimals();
 
         swapRouteForWant.push(
-            IVelodromeRouter.Routes(
+            IVelodromeRouter.Route(
                 address(other),
                 address(want),
                 isStablePool,
@@ -282,7 +193,7 @@ contract StrategySingleSidedVelodrome is BaseStrategy {
             )
         );
         swapRouteForOther.push(
-            IVelodromeRouter.Routes(
+            IVelodromeRouter.Route(
                 address(want),
                 address(other),
                 isStablePool,
@@ -449,6 +360,7 @@ contract StrategySingleSidedVelodrome is BaseStrategy {
             address(poolToken0),
             address(poolToken1),
             isStablePool,
+            factory,
             _liquidity
         );
     }
@@ -503,7 +415,7 @@ contract StrategySingleSidedVelodrome is BaseStrategy {
         if (toFree > wantBalance) {
             toFree = toFree - wantBalance;
 
-            (, uint256 withdrawalLoss) = withdrawSome(toFree);
+            (, uint256 withdrawalLoss) = _withdrawSome(toFree);
             //when we withdraw we can lose money in the withdrawal
             if (withdrawalLoss < _profit) {
                 _profit = _profit - withdrawalLoss;
@@ -571,13 +483,15 @@ contract StrategySingleSidedVelodrome is BaseStrategy {
                 ((DENOMINATOR - slippageProtectionIn) / DENOMINATOR);
 
         // swap want to other
-        router.swapExactTokensForTokens(
-            amountToSwap,
-            minOtherOut,
-            swapRouteForOther,
-            address(this),
-            block.timestamp
-        );
+        if (amountToSwap > 0) {
+            router.swapExactTokensForTokens(
+                amountToSwap,
+                minOtherOut,
+                swapRouteForOther,
+                address(this),
+                block.timestamp
+            );
+        }
 
         // check and see what we have after swaps
         uint256 wantBalance = want.balanceOf(address(this));
@@ -604,7 +518,7 @@ contract StrategySingleSidedVelodrome is BaseStrategy {
     }
 
     //safe to enter more than we have
-    function withdrawSome(uint256 _amount)
+    function _withdrawSome(uint256 _amount)
         internal
         returns (uint256 _liquidatedAmount, uint256 _loss)
     {
@@ -648,7 +562,7 @@ contract StrategySingleSidedVelodrome is BaseStrategy {
 
             //if we have less than 18 decimals we need to lower the amount out
             wantMin =
-                (toWithdraw * (DENOMINATOR - (slippageProtectionOut))) /
+                (wantMin * (DENOMINATOR - (slippageProtectionOut))) /
                 (DENOMINATOR);
             if (want_decimals < 18) {
                 wantMin = wantMin / (10**(uint256(uint8(18) - want_decimals)));
@@ -683,13 +597,15 @@ contract StrategySingleSidedVelodrome is BaseStrategy {
                 ((DENOMINATOR - slippageProtectionOut) / DENOMINATOR);
 
         // swap other to want
-        router.swapExactTokensForTokens(
-            otherBalance,
-            minWantOut,
-            swapRouteForWant,
-            address(this),
-            block.timestamp
-        );
+        if (otherBalance > 0) {
+            router.swapExactTokensForTokens(
+                otherBalance,
+                minWantOut,
+                swapRouteForWant,
+                address(this),
+                block.timestamp
+            );
+        }
 
         uint256 diff = want.balanceOf(address(this)) - (wantBalanceBefore);
 
@@ -709,9 +625,7 @@ contract StrategySingleSidedVelodrome is BaseStrategy {
     {
         uint256 wantBal = want.balanceOf(address(this));
         if (wantBal < _amountNeeded) {
-            (_liquidatedAmount, _loss) = withdrawSome(
-                _amountNeeded - (wantBal)
-            );
+            (_liquidatedAmount, _loss) = _withdrawSome(_amountNeeded - wantBal);
         }
 
         _liquidatedAmount = Math.min(

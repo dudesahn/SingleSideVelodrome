@@ -1,5 +1,5 @@
 from brownie import chain, Contract, interface
-from utils import harvest_strategy
+from utils import harvest_strategy, check_status
 import pytest
 
 # test the our strategy's ability to deposit, harvest, and withdraw, with different optimal deposit tokens if we have them
@@ -18,7 +18,6 @@ def test_simple_harvest(
     target,
     use_yswaps,
     is_gmx,
-    gauge,
     to_sweep,
 ):
     ## deposit to the vault after approving
@@ -26,6 +25,10 @@ def test_simple_harvest(
     token.approve(vault, 2**256 - 1, {"from": whale})
     vault.deposit(amount, {"from": whale})
     newWhale = token.balanceOf(whale)
+
+    # check our current status
+    print("\nBefore first harvest")
+    strategy_params = check_status(strategy, vault)
 
     # harvest, store asset amount
     (profit, loss, extra) = harvest_strategy(
@@ -41,6 +44,10 @@ def test_simple_harvest(
     assert old_assets > 0
     assert strategy.estimatedTotalAssets() > 0
 
+    # check our current status
+    print("\nAfter first harvest")
+    strategy_params = check_status(strategy, vault)
+
     # simulate profits
     chain.sleep(sleep_time)
 
@@ -55,25 +62,10 @@ def test_simple_harvest(
         target,
     )
     print("Profit:", profit / 1e18)
-    # ~0.523774613% left in strategy after harvest
 
-    # check how much velo is claimable to know how effective our selling is
-    print("\nClaimable after first harvest:", strategy.claimableRewards() / 1e18)
-    print("Reward per Token Paid", gauge.userRewardPerTokenPaid(strategy) / 1e18)
-    print("Rewards", gauge.rewards(strategy) / 1e18)
-    print("Strategy velo balance:", to_sweep.balanceOf(strategy) / 1e18)
-
-    # check the balance of each of our tokens, should be close to zero
-    token0 = interface.IERC20(strategy.poolToken0())
-    token1 = interface.IERC20(strategy.poolToken1())
-    token0_balance = token0.balanceOf(strategy) / 1e6
-    token1_balance = token1.balanceOf(strategy) / 1e18
-    print("\n🧐 Token 0 Balance after Harvest (USDC):", token0_balance, token0.symbol())
-    print("🧐 Token 1 Balance after Harvest (BLU):", token1_balance, token1.symbol())
-    efficiency = (token0.balanceOf(strategy) * 100) / (
-        gauge.userRewardPerTokenPaid(strategy) * 0.09 / 1e12
-    )
-    print("Volatile Vault swap leftover:", "{:,.4f}%".format(efficiency))
+    # check our current status
+    print("\nAfter second harvest")
+    strategy_params = check_status(strategy, vault)
 
     # record this here so it isn't affected if we donate via ySwaps
     strategy_assets = strategy.estimatedTotalAssets()
@@ -90,6 +82,10 @@ def test_simple_harvest(
             profit_amount,
             target,
         )
+
+        # check our current status
+        print("\nAfter extra ySwaps harvest")
+        strategy_params = check_status(strategy, vault)
 
     # evaluate our current total assets
     new_assets = vault.totalAssets()
