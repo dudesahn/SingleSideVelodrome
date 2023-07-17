@@ -20,7 +20,6 @@ def test_emergency_exit(
     use_yswaps,
     RELATIVE_APPROX,
     is_gmx,
-    gauge,
 ):
     ## deposit to the vault after approving
     starting_whale = token.balanceOf(whale)

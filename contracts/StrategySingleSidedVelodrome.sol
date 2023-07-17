@@ -107,7 +107,7 @@ interface IVelodromePool is IERC20 {
         returns (uint256 amount);
 }
 
-abstract contract StrategySingleSidedVelodrome is BaseStrategy {
+contract StrategySingleSidedVelodrome is BaseStrategy {
     using SafeERC20 for IERC20;
 
     /* ========== STATE VARIABLES ========== */
@@ -240,6 +240,7 @@ abstract contract StrategySingleSidedVelodrome is BaseStrategy {
         healthCheck = 0x3d8F58774611676fd196D26149C71a9142C45296;
 
         // should be able to get everything from the pool token itself—token0, token1, stable, factory
+        pool = IVelodromePool(_pool);
         poolToken0 = IERC20(pool.token0());
         poolToken1 = IERC20(pool.token1());
         factory = pool.factory();
@@ -259,7 +260,7 @@ abstract contract StrategySingleSidedVelodrome is BaseStrategy {
         pool.approve(address(router), type(uint256).max);
         poolToken0.approve(address(router), type(uint256).max);
         poolToken1.approve(address(router), type(uint256).max);
-        pool.approve(address(yvToken), type(uint256).max);
+        pool.approve(_yvToken, type(uint256).max);
 
         if (
             address(want) != address(poolToken0) &&
@@ -282,8 +283,8 @@ abstract contract StrategySingleSidedVelodrome is BaseStrategy {
         );
         swapRouteForOther.push(
             IVelodromeRouter.Routes(
-                address(other),
                 address(want),
+                address(other),
                 isStablePool,
                 factory
             )
@@ -542,7 +543,7 @@ abstract contract StrategySingleSidedVelodrome is BaseStrategy {
         _depositToPool(_wantToInvest);
 
         // deposit to yearn vault
-        yvToken.deposit();
+        yvToken.deposit(pool.balanceOf(address(this)));
         lastInvest = block.timestamp;
     }
 
